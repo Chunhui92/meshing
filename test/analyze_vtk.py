@@ -20,6 +20,9 @@ def build_parser():
     parser.add_argument("--reference-silo", default=None, help="Optional source Silo file for material-volume comparison")
     parser.add_argument("--max-zones", type=int, default=None, help="Restrict the reference Silo comparison to the first N zones")
     parser.add_argument("--expect-cell-types", nargs="*", type=int, default=[VTK_TETRA, VTK_HEXAHEDRON], help="Allowed VTK cell types")
+    parser.add_argument("--max-boundary-edges", type=int, default=None, help="Fail if any material surface exceeds this many boundary edges")
+    parser.add_argument("--max-non-manifold-edges", type=int, default=None, help="Fail if any material surface exceeds this many non-manifold edges")
+    parser.add_argument("--max-rel-total-error", type=float, default=None, help="Fail if any material exceeds this relative total-domain volume error")
     return parser
 
 
@@ -59,6 +62,10 @@ def main():
     if unexpected:
         print("Unexpected cell types:", unexpected)
 
+    failures = []
+    if unexpected:
+        failures.append("unexpected cell types: {}".format(unexpected))
+
     if "material_id" not in mesh.cell_data:
         raise ValueError("VTK file does not contain CELL_DATA material_id")
 
@@ -75,6 +82,7 @@ def main():
     if args.reference_silo:
         reference = compute_reference_material_volumes(load_mesh(args.reference_silo), max_zones=args.max_zones)
         total_reference = sum(reference.values())
+        rel_errors = {}
         print("Reference material volumes:")
         for material_id in sorted(reference):
             print("  {} -> {:.9f}".format(material_id, reference[material_id]))
@@ -84,7 +92,16 @@ def main():
             reference_volume = reference.get(material_id, 0.0)
             output_volume = output_volumes.get(material_id, 0.0)
             rel_error = abs(output_volume - reference_volume) / total_reference if total_reference > 0.0 else 0.0
+            rel_errors[material_id] = rel_error
             print("  {} -> {:.6e}".format(material_id, rel_error))
+            if args.max_rel_total_error is not None and rel_error > args.max_rel_total_error:
+                failures.append(
+                    "material {} relative total error {:.6e} exceeds {:.6e}".format(
+                        material_id,
+                        rel_error,
+                        args.max_rel_total_error,
+                    )
+                )
 
     print("Surface topology by material:")
     for material_id in sorted(set(int(value) for value in mesh.cell_data["material_id"])):
@@ -101,6 +118,31 @@ def main():
                 count_feature_edges(surface, boundary=False, non_manifold=True),
             )
         )
+        boundary_edges = count_feature_edges(surface, boundary=True, non_manifold=False)
+        non_manifold_edges = count_feature_edges(surface, boundary=False, non_manifold=True)
+        if args.max_boundary_edges is not None and boundary_edges > args.max_boundary_edges:
+            failures.append(
+                "material {} boundary edges {} exceeds {}".format(
+                    material_id,
+                    boundary_edges,
+                    args.max_boundary_edges,
+                )
+            )
+        if args.max_non_manifold_edges is not None and non_manifold_edges > args.max_non_manifold_edges:
+            failures.append(
+                "material {} non-manifold edges {} exceeds {}".format(
+                    material_id,
+                    non_manifold_edges,
+                    args.max_non_manifold_edges,
+                )
+            )
+
+    if failures:
+        print("FAIL")
+        for failure in failures:
+            print("  - {}".format(failure))
+        raise SystemExit(1)
+    print("PASS")
 
 
 if __name__ == "__main__":

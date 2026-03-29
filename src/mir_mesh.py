@@ -207,6 +207,113 @@ class UcdSiloMesh:
         return tetrahedralize_hex(zone.points)
 
 
+class MultiBlockUcdSiloMesh:
+    def __init__(self, reader, block_specs):
+        self.reader = reader
+        self.block_specs = list(block_specs)
+        self.blocks = []
+        self.global_points = {}
+        self.num_zones = 0
+
+        for block_index, spec in enumerate(self.block_specs):
+            mesh_prefix = spec["mesh_prefix"]
+            material_prefix = spec["material_prefix"]
+            zonelist_prefix = spec["zonelist_prefix"]
+
+            x = reader.read_array("/{}_coord0".format(mesh_prefix)).astype(np.float64)
+            y = reader.read_array("/{}_coord1".format(mesh_prefix)).astype(np.float64)
+            z = reader.read_array("/{}_coord2".format(mesh_prefix)).astype(np.float64)
+            points = np.column_stack((x, y, z))
+            gnodeno_name = "/{}_gnodeno".format(mesh_prefix)
+            if reader.has(gnodeno_name):
+                global_node_ids = reader.read_array(gnodeno_name).astype(np.int64)
+            else:
+                base = len(self.global_points)
+                global_node_ids = np.arange(base, base + len(points), dtype=np.int64)
+
+            for local_id, global_id in enumerate(global_node_ids):
+                global_id = int(global_id)
+                point = points[local_id]
+                existing = self.global_points.get(global_id)
+                if existing is None:
+                    self.global_points[global_id] = point.copy()
+                elif not np.allclose(existing, point, atol=1.0e-10, rtol=0.0):
+                    raise ValueError(
+                        "Global node {} has inconsistent coordinates across blocks".format(global_id)
+                    )
+
+            self.blocks.append(
+                {
+                    "block_index": block_index,
+                    "mesh_prefix": mesh_prefix,
+                    "material_prefix": material_prefix,
+                    "zonelist_prefix": zonelist_prefix,
+                    "points": points,
+                    "global_node_ids": global_node_ids,
+                    "matlist": reader.read_array("/{}_matlist".format(material_prefix)),
+                    "mix_vf": reader.read_array("/{}_mix_vf".format(material_prefix)).astype(np.float64),
+                    "mix_next": reader.read_array("/{}_mix_next".format(material_prefix)),
+                    "mix_mat": reader.read_array("/{}_mix_mat".format(material_prefix)),
+                    "shapesize": int(reader.read_array("/{}_shapesize".format(zonelist_prefix))[0]),
+                    "shapecnt": int(reader.read_array("/{}_shapecnt".format(zonelist_prefix))[0]),
+                    "nodelist": reader.read_array("/{}_nodelist".format(zonelist_prefix)).astype(np.int64),
+                }
+            )
+            self.num_zones += self.blocks[-1]["shapecnt"]
+
+        if not self.global_points:
+            raise ValueError("No multiblock UCD points were detected")
+
+        self.global_id_to_index = {global_id: idx for idx, global_id in enumerate(sorted(self.global_points))}
+        self.points = np.zeros((len(self.global_id_to_index), 3), dtype=np.float64)
+        for global_id, idx in self.global_id_to_index.items():
+            self.points[idx] = self.global_points[global_id]
+        self.num_nodes = len(self.points)
+
+        for block in self.blocks:
+            if block["shapesize"] != 8:
+                raise ValueError(
+                    "Only 8-node hexahedral multiblock UCD zones are supported, got {}".format(block["shapesize"])
+                )
+            block["node_ids"] = np.asarray(
+                [self.global_id_to_index[int(global_id)] for global_id in block["global_node_ids"]],
+                dtype=np.int64,
+            )
+
+    def original_points(self):
+        return self.points
+
+    def iter_zones(self):
+        zone_id = 0
+        for block in self.blocks:
+            shapesize = block["shapesize"]
+            for local_zone_id in range(block["shapecnt"]):
+                start = local_zone_id * shapesize
+                local_ids = block["nodelist"][start:start + shapesize]
+                node_ids = block["node_ids"][local_ids]
+                points = self.points[node_ids]
+                volume = sum(tet_volume(tet) for tet in tetrahedralize_hex(points))
+                center = np.mean(points, axis=0)
+                yield Zone(
+                    zone_id=zone_id,
+                    center=center,
+                    volume=volume,
+                    materials=decode_materials(
+                        block["matlist"],
+                        block["mix_vf"],
+                        block["mix_next"],
+                        block["mix_mat"],
+                        local_zone_id,
+                    ),
+                    points=points,
+                    node_ids=node_ids,
+                )
+                zone_id += 1
+
+    def zone_tets(self, zone):
+        return tetrahedralize_hex(zone.points)
+
+
 def detect_rectilinear_mesh(reader):
     for symbol in sorted(reader.symbols):
         if symbol.endswith("_coord0"):
@@ -243,8 +350,49 @@ def detect_zonelist_prefix(reader):
     return None
 
 
+def detect_multiblock_specs(reader):
+    block_names = sorted(
+        {
+            match.group(1)
+            for symbol in reader.symbols
+            for match in [re.match(r"^/(block\d+)/", symbol)]
+            if match is not None
+        }
+    )
+    block_specs = []
+    for block_name in block_names:
+        mesh_prefix = "{}/mesh1".format(block_name)
+        material_prefix = "{}/mat1".format(block_name)
+        zonelist_prefix = "{}/zl1".format(block_name)
+        needed = (
+            "/{}_coord0".format(mesh_prefix),
+            "/{}_coord1".format(mesh_prefix),
+            "/{}_coord2".format(mesh_prefix),
+            "/{}_matlist".format(material_prefix),
+            "/{}_mix_vf".format(material_prefix),
+            "/{}_mix_next".format(material_prefix),
+            "/{}_mix_mat".format(material_prefix),
+            "/{}_nodelist".format(zonelist_prefix),
+            "/{}_shapesize".format(zonelist_prefix),
+            "/{}_shapecnt".format(zonelist_prefix),
+        )
+        if all(reader.has(name) for name in needed):
+            block_specs.append(
+                {
+                    "mesh_prefix": mesh_prefix,
+                    "material_prefix": material_prefix,
+                    "zonelist_prefix": zonelist_prefix,
+                }
+            )
+    return block_specs
+
+
 def load_mesh(path):
     reader = PDBLiteReader(path)
+    multiblock_specs = detect_multiblock_specs(reader)
+    if multiblock_specs:
+        return MultiBlockUcdSiloMesh(reader, multiblock_specs)
+
     material_prefix = detect_material_prefix(reader)
     if material_prefix is None:
         raise ValueError("No Silo material block was found in {}".format(path))

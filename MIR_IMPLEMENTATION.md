@@ -2,78 +2,63 @@
 
 ## 概要
 
-当前仓库实现的是一个 **第一阶段 MIR 原型**：
+当前仓库实现的是一个 **zoo-only 的第一阶段 MIR 原型**：
 
 - 输入：Silo mixed-material 数据
 - 输出：VTK `UNSTRUCTURED_GRID`
-- 重点能力：节点重采样、共享点缓存、二材料 `zoo` 主路径、VTK 分析/可视化
+- 当前主线：共享点、节点体积分数字段、逐材料顺序裁剪、局部体积分数校正、VTK 分析/可视化
 
-这不是完整的 VisIt 风格 Zoo MIR。当前实现仍然只对二材料混合 zone 做强支持。
+这不是完整的 VisIt 风格 Zoo MIR，也不是最终 watertight 的生产级多材料重建器；当前目标是建立一个稳定、可扩展、可验证的 `zoo` 主干。
 
 ## 目录结构
 
 - [main.py](/d:/agentsAI/meshing/main.py)
-  - 根目录唯一入口
-- [mir_mesh.py](/d:/agentsAI/meshing/src/mir_mesh.py)
+  - 根目录唯一入口，当前只暴露 `zoo` 模式
+- [src/mir_mesh.py](/d:/agentsAI/meshing/src/mir_mesh.py)
   - Silo/PDB reader、mesh 检测、zone 迭代
-- [mir_reconstruct.py](/d:/agentsAI/meshing/src/mir_reconstruct.py)
-  - 节点重采样、共享点缓存、三种重建模式
-- [mir_utils.py](/d:/agentsAI/meshing/src/mir_utils.py)
+- [src/mir_reconstruct.py](/d:/agentsAI/meshing/src/mir_reconstruct.py)
+  - 节点体积分数重采样、共享点缓存、zoo-only 重建、局部体积分数校正
+- [src/mir_utils.py](/d:/agentsAI/meshing/src/mir_utils.py)
   - 几何辅助函数
-- [analyze_vtk.py](/d:/agentsAI/meshing/test/analyze_vtk.py)
-  - VTK 可读性、体积、拓扑定量分析
-- [visualize_vtk.py](/d:/agentsAI/meshing/test/visualize_vtk.py)
+- [test/analyze_vtk.py](/d:/agentsAI/meshing/test/analyze_vtk.py)
+  - VTK 可读性、体积、拓扑、阈值化 pass/fail 分析
+- [test/visualize_vtk.py](/d:/agentsAI/meshing/test/visualize_vtk.py)
   - VTK 可视化
 - [MIR_ROADMAP.md](/d:/agentsAI/meshing/MIR_ROADMAP.md)
-  - 后续开发路线图
+  - 当前 zoo-only 路线图
 
-## 当前支持的模式
+## 当前 `zoo` 实现
 
-### `--mode zoo`
+### 1. 材料预处理
 
-当前默认模式。
+- 每个 zone 先按 `--min-fraction` 过滤小体积分数材料
+- 对剩余材料重新归一化
+- 按体积分数从大到小排序
 
-做法：
+### 2. 几何表示
 
-- 先做 `cell -> node` 体积分数重采样
-- 用共享点缓存复用边交点
-- 对二材料 mixed zone 构造面一致的 12-tet 辅助分解
-- 在 tet 顶点上用 `phi = VF(mat_a) - VF(mat_b)` 做局部分割
+- zone 仍然使用确定性的 face-consistent tet 辅助分解
+- 保留三类点：
+  - corner nodes
+  - edge intersections
+  - zone-local helper points
+- 共享点缓存保留，但缓存键已扩展为 `edge + clip context`
 
-特点：
+### 3. 重建路径
 
-- 比 `fast` 平滑
-- 比旧的局部独立切分更一致
-- 仍有 non-manifold 表面问题
+- 二材料 zone 与多材料 zone 共用同一条 `zoo` 路径
+- 对当前 residual 逐个材料做顺序裁剪
+- 每一步使用节点体积分数字段构造标量场
+- 最后一个材料接收 residual
+- 不再回退到 `plane` 或 `fast`
 
-### `--mode plane`
+### 4. 体积分数校正
 
-旧基线路径。
-
-做法：
-
-- 用全局材料质心估计 split normal
-- 在 tetrahedralized zone 上按体积分数做平面裁剪
-
-特点：
-
-- 体积误差较小
-- 在 `ucd3d.silo` 上拓扑更干净
-- 在 `rect3d.silo` 上非常慢
-
-### `--mode fast`
-
-rectilinear-only 速度基线。
-
-做法：
-
-- 仅沿主轴切分 mixed voxel
-
-特点：
-
-- 很快
-- 体积几乎精确
-- 界面明显方块化
+- 每次裁剪都做一维二分校正
+- 目标是在不改变拓扑框架的前提下，让当前材料片段体积逼近目标体积分数
+- 当前暴露参数：
+  - `--volume-correction-iters`
+  - `--volume-correction-tol`
 
 ## 当前实现边界
 
@@ -82,93 +67,92 @@ rectilinear-only 速度基线。
 - 轻量 Silo mixed-material 读取
 - rectilinear mesh
 - UCD 8-node hex mesh
-- `cell -> node` 重采样
-- shared-point cache
-- `zoo / plane / fast`
-- in-memory VTK writer
+- multiblock UCD 8-node hex mesh（通过 block 级 `mesh1/zl1/mat1` 聚合）
+- `cell -> node` 体积分数重采样
+- zoo-only 重建
+- 共享点缓存
+- 局部体积分数校正
+- VTK 输出
 - VTK 定量分析和可视化
 
 未实现：
 
-- `>2` 材料完整 zoo 重建
-- 完整 zoo case-table
-- Isovolume 兜底
-- 体积分数迭代校正
+- 完整 VisIt 风格 zoo case-table
+- 完整 `>2` 材料生产级 watertight 输出保证
+- 2D mesh 上的 zoo 重建（例如 `torus_mat.silo` 这类仅可做材料分布检查的数据）
+- Isovolume fallback
 - species / mixed variable 传播
-- 完整拓扑稳定的 watertight 多材料界面
+- 大规模性能优化、并行化、GPU
 
 ## 常用命令
 
 重建：
 
 ```powershell
-& 'D:\programs\conda\python.exe' main.py data\rect3d.silo rect3d_zoo.vtk --mode zoo
-& 'D:\programs\conda\python.exe' main.py data\rect3d.silo rect3d_fast_new.vtk --mode fast
-& 'D:\programs\conda\python.exe' main.py data\ucd3d.silo ucd3d_zoo.vtk --mode zoo
-& 'D:\programs\conda\python.exe' main.py data\ucd3d.silo ucd3d_plane_new.vtk --mode plane
+& 'D:\programs\conda\python.exe' main.py data\rect3d.silo rect3d_zoo.vtk
+& 'D:\programs\conda\python.exe' main.py data\ucd3d.silo ucd3d_zoo.vtk
+& 'D:\programs\conda\python.exe' main.py data\rect3d.silo rect3d_smoke.vtk --max-zones 200
 ```
 
 分析：
 
 ```powershell
-& 'D:\programs\conda\python.exe' test\analyze_vtk.py rect3d_zoo.vtk --reference-silo data\rect3d.silo
-& 'D:\programs\conda\python.exe' test\analyze_vtk.py ucd3d_zoo.vtk --reference-silo data\ucd3d.silo
+& 'D:\programs\conda\python.exe' test\analyze_vtk.py rect3d_zoo.vtk --reference-silo data\rect3d.silo --max-boundary-edges 0 --max-rel-total-error 1e-3
+& 'D:\programs\conda\python.exe' test\analyze_vtk.py ucd3d_zoo.vtk --reference-silo data\ucd3d.silo --max-boundary-edges 0 --max-rel-total-error 1e-3
 ```
 
 可视化：
 
 ```powershell
 & 'D:\programs\conda\python.exe' test\visualize_vtk.py rect3d_zoo.vtk --interfaces
-& 'D:\programs\conda\python.exe' test\visualize_vtk.py rect3d_fast_new.vtk --interfaces
+```
+
+材料分布检查：
+
+```powershell
+& 'D:\programs\conda\python.exe' test\inspect_silo_materials.py data\multi_ucd3d.silo
+& 'D:\programs\conda\python.exe' test\inspect_silo_materials.py data\torus_mat.silo
 ```
 
 ## 已验证结果
 
-### `rect3d.silo`
+### `rect3d.silo` smoke (`--max-zones 200`)
 
-`--mode zoo`：
-
-- 553101 cells
-- 124376 points
-- 最大总域相对体积误差约 `1.93e-3`
+- 8426 cells
+- 56482 points
 - `boundary_edges = 0`
-- `non_manifold_edges` 非零
+- 最大总体积相对误差约 `2.58e-06`
+- `non_manifold_edges` 仍非零
 
-`--mode fast`：
+### `ucd3d.silo` smoke (`--max-zones 200`)
 
-- 49818 cells
-- 260489 points
-- 体积几乎精确
-- 外观明显方块化
-
-`--mode plane`：
-
-- 当前环境下全量运行超过 4 小时仍未完成
-
-### `ucd3d.silo`
-
-`--mode zoo`：
-
-- 20500 cells
-- 5845 points
-- material 1 / 4 总域相对体积误差约 `2.49e-3`
+- 3060 cells
+- 7426 points
 - `boundary_edges = 0`
-- `non_manifold_edges` 非零
+- 最大总体积相对误差约 `6.72e-06`
+- `non_manifold_edges` 仍非零
 
-`--mode plane`：
+### 人工 3 材料 mock case
 
-- 31420 cells
-- 121846 points
-- 体积误差接近数值零
-- `boundary_edges = 0`
-- `non_manifold_edges = 0`
+- 3 材料顺序裁剪路径可执行
+- 能生成可读 VTK
+- 当前仓库样例数据本身只包含 1/2 材料 zone，因此 `>2` 材料回归仍需要补专门测试集
+
+### 新补数据检查
+
+- `multi_ucd3d.silo`
+  - 可由当前 multiblock loader 读取
+  - 全量 `53176` 个 zone 中，`3808` 个是二材料 zone
+  - 不包含 `>2` 材料 zone
+- `torus_mat.silo`
+  - 当前 3D zoo 重建器不支持其 mesh 类型
+  - 但材料块统计显示：`840` 个单材料、`16` 个二材料、`44` 个三材料 zone
+  - 可作为后续 `>2` 材料材料分布检查样例，但不能直接用于当前 3D 重建验证
 
 ## 工程判断
 
 当前版本的定位是：
 
-**一个可运行、可分析、可扩展的 MIR 第一阶段原型。**
+**一个可运行、可分析、可扩展、zoo-only 的 MIR 第一阶段原型。**
 
-它已经具备继续扩展所需的基本结构，但算法核心还没有达到完整、稳健、一般多材料的 Zoo MIR 水平。
-
-后续工作请直接参考 [MIR_ROADMAP.md](/d:/agentsAI/meshing/MIR_ROADMAP.md)。
+它已经具备继续扩展所需的主干结构，但仍需要继续降低 non-manifold 问题、补多材料专门回归样例，并逐步接近更完整的 Zoo MIR。
